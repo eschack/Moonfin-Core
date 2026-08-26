@@ -122,6 +122,87 @@ bool downloadUsesPluginEngine({
   return true;
 }
 
+/// Builds the plugin task that transfers one media file to [savePath].
+///
+/// Always a single-connection task issuing a direct GET:
+/// ParallelDownloadTask first sends a HEAD request to size the file, which
+/// Jellyfin rejects with 405 on its download and stream endpoints.
+///
+/// Android targets the destination with a `file://` [bgd.UriDownloadTask],
+/// which the native runner writes to directly: no temp file, and no
+/// completing `Files.move`. That move matters because on Android TV flash a
+/// cross-directory move inside app storage can degrade to a ~1 MB/s
+/// userspace copy, parking multi-gigabyte downloads in "Finalizing" for tens
+/// of minutes. The cost is that Uri tasks cannot pause or resume — a retry
+/// restarts from the first byte — which the direct write is worth. Every
+/// other platform keeps the temp-then-move task, where the move is an
+/// instant rename.
+@visibleForTesting
+Future<bgd.DownloadTask> buildMediaDownloadTask({
+  required bool isAndroid,
+  required String taskId,
+  required String url,
+  required String savePath,
+  required bool resumable,
+  required Map<String, String> headers,
+  required bool requiresWiFi,
+  required String metaData,
+  required String displayName,
+}) async {
+  // A transcoded stream has an unknown length and no resume support, and a
+  // retry would restart the whole server transcode, so errors surface to
+  // the user instead of retrying automatically.
+  if (isAndroid) {
+    final directory = p.posix.dirname(savePath);
+    final filename = p.posix.basename(savePath);
+    final mispacked = bgd.UriDownloadTask(
+      taskId: taskId,
+      url: url,
+      directoryUri: Uri.file(directory, windows: false),
+      filename: filename,
+      headers: headers,
+      group: BackgroundDownloadCoordinator.mediaGroup,
+      updates: bgd.Updates.statusAndProgress,
+      requiresWiFi: requiresWiFi,
+      retries: resumable ? 3 : 0,
+      metaData: metaData,
+      displayName: displayName,
+    );
+    // The plugin's constructor packs the task's fileUri by feeding the
+    // directory's already-encoded path back through Uri.file, encoding the
+    // escapes a second time. The Android runner decodes that fileUri
+    // exactly once when it opens the destination, so the double-encoded
+    // form resolves to a literal "%20" path and a download to any path
+    // with a space fails with ENOENT. Rebuild the task with a
+    // single-encoded fileUri, which that one decode turns back into the
+    // real save path. The format mirrors the plugin's own pack(), which is
+    // not exported in 9.5.6.
+    final correctlyPacked =
+        ':::$filename::::::${Uri.file(savePath, windows: false)}:::';
+    return bgd.Task.createFromJson(
+      mispacked.toJson()..['filename'] = correctlyPacked,
+    ) as bgd.DownloadTask;
+  }
+  final (baseDirectory, directory, filename) = await splitDownloadPath(
+    savePath,
+  );
+  return bgd.DownloadTask(
+    taskId: taskId,
+    url: url,
+    filename: filename,
+    directory: directory,
+    baseDirectory: baseDirectory,
+    headers: headers,
+    group: BackgroundDownloadCoordinator.mediaGroup,
+    updates: bgd.Updates.statusAndProgress,
+    requiresWiFi: requiresWiFi,
+    retries: resumable ? 3 : 0,
+    allowPause: resumable,
+    metaData: metaData,
+    displayName: displayName,
+  );
+}
+
 /// The native engine rejected the server's TLS certificate, so the download
 /// should be retried on the legacy engine, which honours the user's
 /// self-signed certificate setting.
@@ -851,37 +932,20 @@ class DownloadService extends ChangeNotifier {
     required String url,
     required _MediaDownloadContext ctx,
     required Map<String, String> headers,
-  }) async {
-    final (baseDirectory, directory, filename) = await splitDownloadPath(
-      ctx.savePath,
-    );
+  }) {
     final metaData = jsonEncode({
       'itemId': ctx.itemId,
       'quality': ctx.quality.name,
       'savePath': ctx.savePath,
     });
-    final requiresWiFi = _prefs.get(UserPreferences.downloadWifiOnly);
-
-    // Always a plain single-connection DownloadTask, which issues a direct
-    // GET. ParallelDownloadTask first sends a HEAD request to size the file,
-    // which Jellyfin rejects with 405 on its download and stream endpoints.
-    //
-    // A transcoded stream has an unknown length and no resume support, and a
-    // retry would restart the whole server transcode, so errors surface to
-    // the user instead of retrying automatically.
-    final resumable = !ctx.quality.isTranscoded;
-    return bgd.DownloadTask(
+    return buildMediaDownloadTask(
+      isAndroid: PlatformDetection.isAndroid,
       taskId: _newTaskId(ctx.itemId),
       url: url,
-      filename: filename,
-      directory: directory,
-      baseDirectory: baseDirectory,
+      savePath: ctx.savePath,
+      resumable: !ctx.quality.isTranscoded,
       headers: headers,
-      group: BackgroundDownloadCoordinator.mediaGroup,
-      updates: bgd.Updates.statusAndProgress,
-      requiresWiFi: requiresWiFi,
-      retries: resumable ? 3 : 0,
-      allowPause: resumable,
+      requiresWiFi: _prefs.get(UserPreferences.downloadWifiOnly),
       metaData: metaData,
       displayName: ctx.displayName,
     );
