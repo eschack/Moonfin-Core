@@ -858,6 +858,9 @@ class DownloadService extends ChangeNotifier {
   }) async {
     // Both engines finish here, so this is the one place a batch can be counted.
     _completedCount++;
+    // Resolved up front: this runs unawaited, and a GetIt read after an await
+    // can land after the service's registrations are gone.
+    final storagePath = _storagePath;
 
     Future<void> runBestEffort(Future<void> task, Duration timeout) async {
       try {
@@ -882,7 +885,7 @@ class DownloadService extends ChangeNotifier {
       );
     }
 
-    if (PlatformDetection.isAndroid && _storagePath.isUsingMediaStore) {
+    if (PlatformDetection.isAndroid && storagePath.isUsingMediaStore) {
       await runBestEffort(
         MediaStoreService.scanFile(savePath),
         const Duration(seconds: 5),
@@ -2966,6 +2969,9 @@ class DownloadService extends ChangeNotifier {
         if (record != null && await _recoverFromTaskRecord(item, record)) {
           continue;
         }
+        if (await _adoptFinishedDownloadFile(item)) {
+          continue;
+        }
         if (item.localFilePath != null) {
           final file = File(item.localFilePath!);
           if (await file.exists()) await file.delete();
@@ -2994,18 +3000,72 @@ class DownloadService extends ChangeNotifier {
           );
         }
       } else if (item.downloadStatus == 2) {
-        if (item.localFilePath != null) {
-          final file = File(item.localFilePath!);
-          if (!await file.exists()) {
-            await _offlineRepo.updateDownloadStatus(
-              item.itemId,
-              3,
-              error: 'File missing from disk',
-            );
-          }
-        }
+        // A missing file here is reported on demand by the offline resolver
+        // at play time. Demoting the row in this sweep would make a brief
+        // storage blip — an ejected adopted-storage card, a slow mount —
+        // permanent: the sweep runs on every start, so every completed row
+        // would flip to failed and stay there after the storage returned.
+      } else {
+        // Rows demoted to failed or reset by an earlier sweep, an offline
+        // play during a storage blip, or the interrupted-download reset.
+        // When the file is verifiably still on disk, re-complete the row
+        // instead of leaving the download unusable.
+        await _adoptFinishedDownloadFile(item);
       }
     }
+  }
+
+  /// Claims the on-disk file of a download whose row no longer says
+  /// completed, when the file itself is fine. That state has several
+  /// origins, all observed in the field: the transfer finished after the
+  /// app died (the worker retired its plugin task record, so no completion
+  /// ever ran); an interrupted-download reset left a finished file behind;
+  /// or a storage blip — an adopted-storage card ejected or slow to mount —
+  /// made a completed row's file briefly invisible and something demoted
+  /// the row to failed. Re-completing against the verifiable file heals
+  /// all of them without re-transferring anything.
+  ///
+  /// Returns false when the file is absent, partial, or unverifiable, so
+  /// the caller falls through to the interrupted-download reset.
+  Future<bool> _adoptFinishedDownloadFile(DownloadedItem row) async {
+    try {
+      if (row.metadataJson.isEmpty) return false;
+      final decoded = jsonDecode(row.metadataJson);
+      if (decoded is! Map<String, dynamic>) return false;
+      final quality = DownloadQuality.values.firstWhere(
+        (q) => q.name == row.qualityPreset,
+        orElse: () => DownloadQuality.original,
+      );
+      // A transcoded file has no authoritative size to verify against, so a
+      // partial transfer cannot be told apart from a complete one.
+      if (quality.isTranscoded) return false;
+      final offlineRoot = await _storagePath.getOfflineRoot();
+      if (_storagePath.isUsingMediaStore) return false;
+      final item = AggregatedItem(
+        id: row.itemId,
+        serverId: row.serverId,
+        rawData: decoded,
+      );
+      final expectedBytes = estimateDownloadSizeBytes(item, quality);
+      final dir = Directory('${offlineRoot.path}/${_buildSubFolder(item)}');
+      final candidates = <String>{
+        // The recorded path can differ from a freshly built name (extension
+        // corrections, legacy layouts), so trust it first when present.
+        if (row.localFilePath != null) row.localFilePath!,
+        '${dir.path}/${_buildFileName(item, quality)}',
+        ..._candidateSavePaths(dir, item),
+      };
+      for (final path in candidates) {
+        final file = File(path);
+        if (!await file.exists()) continue;
+        final length = await file.length();
+        if (length == 0) continue;
+        if (expectedBytes > 0 && length < expectedBytes * 0.98) continue;
+        await _persistCompletedFile(row.itemId, path, quality);
+        return true;
+      }
+    } catch (_) {}
+    return false;
   }
 
   /// Resolves an in-progress drift row against its native task record.
